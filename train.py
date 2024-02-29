@@ -22,11 +22,30 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import matplotlib.pyplot as plt
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+class loss_curve:
+    def __init__(self, save_path):
+        self.path = save_path
+        self.losses = []
+        self.iters = []
+    def record(self, loss, iter):
+        self.iters.append(iter)
+        self.losses.append(loss)
+    def draw(self):
+        import matplotlib.pyplot as plt
+        plt.switch_backend('Agg')
+        plt.plot(self.losses,'b',label = 'loss')
+        plt.ylabel('loss')
+        plt.xlabel('iteration')
+        plt.savefig(os.path.join(self.path))
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -34,6 +53,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    loss_recorder = loss_curve(dataset.model_path+'/loss.jpg')
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -71,6 +91,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
+            print(gaussians.get_opacity.shape)
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -89,7 +110,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        deltaR, deltaS, deltaX = render_pkg["deltaR"],render_pkg["deltaS"],render_pkg["deltaX"]
+        Ll2 = 0
+        if deltaR is not None:
+            Ll2 += l1_loss(deltaR, torch.zeros(deltaR.shape).cuda())
+        if deltaS is not None:
+            Ll2 += l1_loss(deltaS, torch.zeros(deltaS.shape).cuda())
+        if deltaX is not None:
+            Ll2 += l1_loss(deltaX, torch.zeros(deltaX.shape).cuda())
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + opt.lambda_reg * Ll2
         loss.backward()
 
         iter_end.record()
@@ -99,9 +128,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                loss_recorder.record(ema_loss_for_log, iteration)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+                loss_recorder.draw()
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
@@ -130,6 +161,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    return dataset.model_path
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -216,7 +249,8 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
-
+    output_folder = training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    
     # All done
     print("\nTraining complete.")
+    os.system("CUDA_VISIBLE_DEVICES=3 python render.py -m {}".format(output_folder))

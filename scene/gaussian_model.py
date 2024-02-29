@@ -111,6 +111,18 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
     
     @property
+    def get_features_dR(self):
+        return self._features_dR
+    
+    @property
+    def get_features_dS(self):
+        return self._features_dS
+    
+    @property
+    def get_features_dX(self):
+        return self._features_dX
+    
+    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
@@ -136,11 +148,19 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+        # SH coefficients for deltaX, deltaR and deltaX
+        features_deltaS = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features_deltaR = torch.zeros((fused_color.shape[0], 4, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features_deltaX = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dS = nn.Parameter(features_deltaS.transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dR = nn.Parameter(features_deltaR.transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dX = nn.Parameter(features_deltaX.transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -150,11 +170,17 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.feature_ds_lr = training_args.feature_ds_lr
+        self.feature_dr_lr = training_args.feature_dr_lr
+        self.deform_from_iter = training_args.deform_from_iter
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._features_dS], 'lr': 0.0, "name": "f_ds"},
+            {'params': [self._features_dR], 'lr': 0.0, "name": "f_dr"},
+            {'params': [self._features_dX], 'lr': 0.0, "name": "f_dx"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
@@ -165,14 +191,24 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        self.feature_dx_scheduler_args = get_expon_lr_func(lr_init=training_args.feature_dx_lr_init,
+                                                    lr_final=training_args.feature_dx_lr_final,
+                                                    lr_delay_mult=training_args.feature_dx_lr_delay_mult,
+                                                    max_steps=training_args.feature_dx_lr_max_steps)
 
     def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
+        # Learning rate scheduling per step 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
+            if param_group["name"] == "f_ds" and iteration >= self.deform_from_iter:
+                param_group['lr'] = self.feature_ds_lr
+            if param_group["name"] == "f_dr" and iteration >= self.deform_from_iter:
+                param_group['lr'] = self.feature_dr_lr
+            if param_group["name"] == "f_dx" and iteration >= self.deform_from_iter:
+                lr = self.feature_dx_scheduler_args(iteration - self.deform_from_iter)
+                param_group['lr'] = lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -181,6 +217,12 @@ class GaussianModel:
             l.append('f_dc_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
+        for i in range(self._features_dS.shape[1]*self._features_dS.shape[2]):
+            l.append('f_ds_{}'.format(i))
+        for i in range(self._features_dR.shape[1]*self._features_dR.shape[2]):
+            l.append('f_dr_{}'.format(i))
+        for i in range(self._features_dX.shape[1]*self._features_dX.shape[2]):
+            l.append('f_dx_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -195,6 +237,9 @@ class GaussianModel:
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_ds = self._features_dS.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dr = self._features_dR.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dx = self._features_dX.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -202,7 +247,7 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, f_ds, f_dr, f_dx, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -234,6 +279,30 @@ class GaussianModel:
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
+        ds_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_ds_")]
+        ds_f_names = sorted(ds_f_names, key = lambda x: int(x.split('_')[-1]))
+        features_deltaS = np.zeros((xyz.shape[0], len(ds_f_names)))
+        for idx, attr_name in enumerate(ds_f_names):
+            features_deltaS[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_deltaS = features_deltaS.reshape((features_deltaS.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+
+        dr_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_dr_")]
+        dr_f_names = sorted(dr_f_names, key = lambda x: int(x.split('_')[-1]))
+        features_deltaR = np.zeros((xyz.shape[0], len(dr_f_names)))
+        for idx, attr_name in enumerate(dr_f_names):
+            features_deltaR[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_deltaR = features_deltaR.reshape((features_deltaR.shape[0], 4, (self.max_sh_degree + 1) ** 2))
+        
+        dx_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_dx_")]
+        dx_f_names = sorted(dx_f_names, key = lambda x: int(x.split('_')[-1]))
+        features_deltaX = np.zeros((xyz.shape[0], len(dx_f_names)))
+        for idx, attr_name in enumerate(dx_f_names):
+            features_deltaX[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_deltaX = features_deltaX.reshape((features_deltaX.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
@@ -249,6 +318,9 @@ class GaussianModel:
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dS = nn.Parameter(torch.tensor(features_deltaS, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dR = nn.Parameter(torch.tensor(features_deltaR, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dX = nn.Parameter(torch.tensor(features_deltaX, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -295,6 +367,9 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_dS = optimizable_tensors['f_ds']
+        self._features_dR = optimizable_tensors['f_dr']
+        self._features_dX = optimizable_tensors['f_dx']
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -326,10 +401,13 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_features_dS, new_features_dR, new_features_dX, new_opacities, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
+        "f_ds": new_features_dS,
+        "f_dr": new_features_dR,
+        "f_dx": new_features_dX,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
@@ -338,6 +416,9 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_dS = optimizable_tensors['f_ds']
+        self._features_dR = optimizable_tensors['f_dr']
+        self._features_dX = optimizable_tensors['f_dx']
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -364,9 +445,12 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_features_dS = self._features_dS[selected_pts_mask].repeat(N,1,1)
+        new_features_dR = self._features_dR[selected_pts_mask].repeat(N,1,1)
+        new_features_dX = self._features_dX[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_dS, new_features_dR, new_features_dX, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -380,11 +464,14 @@ class GaussianModel:
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
+        new_features_dS = self._features_dS[selected_pts_mask]
+        new_features_dR = self._features_dR[selected_pts_mask]
+        new_features_dX = self._features_dX[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_dS, new_features_dR, new_features_dX, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
