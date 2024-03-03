@@ -33,9 +33,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
     dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-    sh2dx = None
-    sh2dr = None
-    sh2ds = None
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -54,9 +51,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    shs_deltaX = pc.get_features_dX.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-    sh2dx = eval_sh(pc.active_sh_degree, shs_deltaX, dir_pp_normalized)
-    means3D = pc.get_xyz + sh2dx
+    means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -68,12 +63,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        shs_deltaS = pc.get_features_dS.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-        shs_deltaR = pc.get_features_dR.transpose(1, 2).view(-1, 4, (pc.max_sh_degree+1)**2)
-        sh2ds = eval_sh(pc.active_sh_degree, shs_deltaS, dir_pp_normalized)
-        sh2dr = eval_sh(pc.active_sh_degree, shs_deltaR, dir_pp_normalized)
-        scales = pc.scaling_activation(pc._scaling + sh2ds)
-        rotations = pc.rotation_activation(pc._rotation + sh2dr)                         # to be modified: should we add deltaR directly to rotations?
+        scales = pc._scaling
+        rotations = pc._rotation                         
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -90,10 +81,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    rendered_image, radii, deltaS, deltaR, deltaX = rasterizer(
         means3D = means3D,
         means2D = means2D,
-        shs = shs,
+        features = pc.get_features,
+        features_deltaR = pc.get_features_dR,
+        features_deltaS = pc.get_features_dS,
+        features_deltaX = pc.get_features_dX,
         colors_precomp = colors_precomp,
         opacities = opacity,
         scales = scales,
@@ -106,9 +100,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "deltaS": sh2ds,
-            "deltaR": sh2dr,
-            "deltaX": sh2dx}
+            "deltaS": deltaS,
+            "deltaR": deltaR,
+            "deltaX": deltaX}
 
 
 def visualize_deformation(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
@@ -150,8 +144,8 @@ def visualize_deformation(viewpoint_camera, pc : GaussianModel, pipe, bg_color :
     means2D = screenspace_points
     opacity = pc.get_opacity
     cov3D_precomp = None
-    scales = pc.get_scaling
-    rotations = pc.get_rotation
+    scales = pc._scaling
+    rotations = pc._rotation
 
     dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
     dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
@@ -166,10 +160,13 @@ def visualize_deformation(viewpoint_camera, pc : GaussianModel, pipe, bg_color :
     colors_precomp = (torch.norm(sh2dx,dim=1) + 0.1*torch.norm(sh2ds,dim=1) + 0.1*torch.norm(sh2dr,dim=1)).repeat(3,1).transpose(0,1)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    rendered_image, _, _, _, _ = rasterizer(
         means3D = means3D,
         means2D = means2D,
-        shs = shs,
+        features = None,
+        features_deltaR = torch.zeros_like(pc.get_features_dR, dtype=pc.get_features_dR.dtype, requires_grad=True, device="cuda"),
+        features_deltaS = torch.zeros_like(pc.get_features_dS, dtype=pc.get_features_dS.dtype, requires_grad=True, device="cuda"),
+        features_deltaX = torch.zeros_like(pc.get_features_dX, dtype=pc.get_features_dX.dtype, requires_grad=True, device="cuda"),
         colors_precomp = colors_precomp,
         opacities = opacity,
         scales = scales,

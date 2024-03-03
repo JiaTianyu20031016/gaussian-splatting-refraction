@@ -51,9 +51,9 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._resolution = -1
-        self._white_background = False
+        self._white_background = True
         self.data_device = "cuda"
-        self.eval = False
+        self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -78,8 +78,8 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.feature_ds_lr = 0.0005 # to be modified
         self.feature_dr_lr = 0.0005 # to be modified
-        self.feature_dx_lr_init = 0.0005
-        self.feature_dx_lr_final = 0.0005
+        self.feature_dx_lr_init = 0.001
+        self.feature_dx_lr_final = 0.00001
         self.feature_dx_lr_delay_mult = 0.01
         self.feature_dx_lr_max_steps = 15_000
         self.opacity_lr = 0.05
@@ -87,7 +87,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_reg = 0.001
+        self.lambda_reg = 0.1
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

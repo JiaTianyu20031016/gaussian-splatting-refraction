@@ -61,6 +61,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -115,9 +116,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if deltaR is not None:
             Ll2 += l1_loss(deltaR, torch.zeros(deltaR.shape).cuda())
         if deltaS is not None:
-            Ll2 += l1_loss(deltaS, torch.zeros(deltaS.shape).cuda())
+            Ll2 += 0.1*l1_loss(deltaS, torch.zeros(deltaS.shape).cuda())
         if deltaX is not None:
-            Ll2 += l1_loss(deltaX, torch.zeros(deltaX.shape).cuda())
+            Ll2 += 0.1*l1_loss(deltaX, torch.zeros(deltaX.shape).cuda())
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + opt.lambda_reg * Ll2
         loss.backward()
 
